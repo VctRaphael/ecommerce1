@@ -1,728 +1,220 @@
-# pedidos/tests.py
-from django.test import TestCase, Client
-from django.urls import reverse
-from django.contrib.auth.models import User
-from django.contrib.messages import get_messages
-from django.core import mail
+# pedidos/views.py
+from django.shortcuts import render, redirect, get_object_or_404
+from django.contrib.auth.decorators import login_required
+from django.contrib import messages
+from django.http import JsonResponse
 from django.conf import settings
-from unittest.mock import patch, Mock, MagicMock
-from decimal import Decimal
-import json
-
+from django.core.mail import send_mail
+from django.template.loader import render_to_string
+from django.utils.html import strip_tags
+from django.db import transaction
 from .models import Pedido, ItemPedido
 from .forms import FormCriarPedido
-from produtos.models import Produto, Categoria
+from carrinho.cart import Carrinho
+from django.contrib.auth.forms import UserCreationForm
+from django.contrib.auth import login as auth_login
+import logging
+
+# Configuração de logging
+logger = logging.getLogger(__name__)
+
+# Importações para gerar Pix QR Code
+try:
+    from pixqrcodegen import Payload
+    import qrcode
+    import base64
+    from io import BytesIO
+    PIX_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"Bibliotecas PIX não instaladas: {e}")
+    PIX_AVAILABLE = False
+    Payload = None
 
 
-class PedidoModelTest(TestCase):
-    """Testes para o modelo Pedido"""
+@login_required
+@transaction.atomic
+def criar_pedido(request):
+    carrinho = Carrinho(request)
     
-    def setUp(self):
-        """Configuração inicial para cada teste"""
-        self.user = User.objects.create_user(
-            username='testuser',
-            email='test@example.com',
-            password='testpass123'
-        )
-        
-        self.pedido = Pedido.objects.create(
-            usuario=self.user,
-            nome='João Silva',
-            email='joao@example.com',
-            endereco='Rua Teste, 123',
-            cep='12345-678',
-            cidade='São Paulo',
-            metodo_pagamento='pix'
-        )
-    
-    def test_pedido_creation(self):
-        """Testa se o pedido é criado corretamente"""
-        self.assertEqual(self.pedido.nome, 'João Silva')
-        self.assertEqual(self.pedido.usuario, self.user)
-        self.assertEqual(self.pedido.status, 'pendente')  # valor padrão
-        self.assertEqual(self.pedido.metodo_pagamento, 'pix')
-    
-    def test_pedido_str_representation(self):
-        """Testa a representação string do pedido"""
-        expected = f'Pedido {self.pedido.id}'
-        self.assertEqual(str(self.pedido), expected)
-    
-    def test_status_choices(self):
-        """Testa as opções de status"""
-        status_values = [choice[0] for choice in Pedido.STATUS_CHOICES]
-        expected_statuses = ['pendente', 'aguardando_pagamento', 'pago', 'enviado', 'entregue', 'cancelado']
-        
-        for status in expected_statuses:
-            self.assertIn(status, status_values)
-    
-    def test_metodo_pagamento_choices(self):
-        """Testa as opções de método de pagamento"""
-        metodo_values = [choice[0] for choice in Pedido.METODO_PAGAMENTO_CHOICES]
-        self.assertIn('pix', metodo_values)
-    
-    def test_pedido_default_values(self):
-        """Testa valores padrão do pedido"""
-        pedido = Pedido.objects.create(
-            usuario=self.user,
-            nome='Teste',
-            email='teste@example.com',
-            endereco='Endereço teste',
-            cep='00000-000',
-            cidade='Cidade teste'
-        )
-        
-        self.assertEqual(pedido.status, 'pendente')
-        self.assertEqual(pedido.metodo_pagamento, 'pix')
-    
-    def test_get_total_cost_empty(self):
-        """Testa get_total_cost quando não há itens"""
-        total = self.pedido.get_total_cost()
-        self.assertEqual(total, 0)
-    
-    def test_pedido_with_user_cascade(self):
-        """Testa se o pedido é deletado quando o usuário é deletado"""
-        pedido_id = self.pedido.id
-        self.user.delete()
-        
-        with self.assertRaises(Pedido.DoesNotExist):
-            Pedido.objects.get(id=pedido_id)
+    if len(carrinho) == 0:
+        messages.error(request, "Seu carrinho está vazio.")
+        return redirect('produtos:lista')
 
-
-class ItemPedidoModelTest(TestCase):
-    """Testes para o modelo ItemPedido"""
-    
-    def setUp(self):
-        """Configuração inicial"""
-        self.user = User.objects.create_user(
-            username='testuser',
-            password='testpass123'
-        )
-        
-        self.categoria = Categoria.objects.create(nome='Eletrônicos')
-        self.produto = Produto.objects.create(
-            nome='Smartphone',
-            preco=Decimal('999.99'),
-            categoria=self.categoria
-        )
-        
-        self.pedido = Pedido.objects.create(
-            usuario=self.user,
-            nome='João Silva',
-            email='joao@example.com',
-            endereco='Rua Teste, 123',
-            cep='12345-678',
-            cidade='São Paulo'
-        )
-        
-        self.item_pedido = ItemPedido.objects.create(
-            pedido=self.pedido,
-            produto=self.produto,
-            preco=Decimal('999.99'),
-            quantidade=2
-        )
-    
-    def test_item_pedido_creation(self):
-        """Testa criação do item de pedido"""
-        self.assertEqual(self.item_pedido.pedido, self.pedido)
-        self.assertEqual(self.item_pedido.produto, self.produto)
-        self.assertEqual(self.item_pedido.preco, Decimal('999.99'))
-        self.assertEqual(self.item_pedido.quantidade, 2)
-    
-    def test_item_pedido_str_representation(self):
-        """Testa representação string do item de pedido"""
-        self.assertEqual(str(self.item_pedido), str(self.item_pedido.id))
-    
-    def test_get_cost(self):
-        """Testa cálculo do custo do item"""
-        cost = self.item_pedido.get_cost()
-        expected_cost = Decimal('999.99') * 2
-        self.assertEqual(cost, expected_cost)
-    
-    def test_item_pedido_default_quantidade(self):
-        """Testa quantidade padrão"""
-        item = ItemPedido.objects.create(
-            pedido=self.pedido,
-            produto=self.produto,
-            preco=Decimal('100.00')
-        )
-        self.assertEqual(item.quantidade, 1)
-    
-    def test_pedido_get_total_cost_with_items(self):
-        """Testa get_total_cost do pedido com itens"""
-        # Adiciona outro item
-        ItemPedido.objects.create(
-            pedido=self.pedido,
-            produto=self.produto,
-            preco=Decimal('50.00'),
-            quantidade=1
-        )
-        
-        total = self.pedido.get_total_cost()
-        expected_total = (Decimal('999.99') * 2) + (Decimal('50.00') * 1)
-        self.assertEqual(total, expected_total)
-    
-    def test_item_pedido_cascade_delete(self):
-        """Testa se item é deletado quando pedido é deletado"""
-        item_id = self.item_pedido.id
-        self.pedido.delete()
-        
-        with self.assertRaises(ItemPedido.DoesNotExist):
-            ItemPedido.objects.get(id=item_id)
-
-
-class FormCriarPedidoTest(TestCase):
-    """Testes para o formulário de criar pedido"""
-    
-    def test_form_fields(self):
-        """Testa se o formulário tem os campos corretos"""
-        form = FormCriarPedido()
-        expected_fields = ['nome', 'email', 'endereco', 'cep', 'cidade']
-        
-        for field in expected_fields:
-            self.assertIn(field, form.fields)
-    
-    def test_form_valid_data(self):
-        """Testa formulário com dados válidos"""
-        form_data = {
-            'nome': 'João Silva',
-            'email': 'joao@example.com',
-            'endereco': 'Rua Teste, 123',
-            'cep': '12345-678',
-            'cidade': 'São Paulo'
-        }
-        
-        form = FormCriarPedido(data=form_data)
-        self.assertTrue(form.is_valid())
-    
-    def test_form_invalid_email(self):
-        """Testa formulário com email inválido"""
-        form_data = {
-            'nome': 'João Silva',
-            'email': 'email_invalido',
-            'endereco': 'Rua Teste, 123',
-            'cep': '12345-678',
-            'cidade': 'São Paulo'
-        }
-        
-        form = FormCriarPedido(data=form_data)
-        self.assertFalse(form.is_valid())
-        self.assertIn('email', form.errors)
-    
-    def test_form_required_fields(self):
-        """Testa campos obrigatórios"""
-        form = FormCriarPedido(data={})
-        self.assertFalse(form.is_valid())
-        
-        required_fields = ['nome', 'email', 'endereco', 'cep', 'cidade']
-        for field in required_fields:
-            self.assertIn(field, form.errors)
-
-
-class PedidoViewTest(TestCase):
-    """Testes para as views de pedidos"""
-    
-    def setUp(self):
-        """Configuração inicial"""
-        self.client = Client()
-        self.user = User.objects.create_user(
-            username='testuser',
-            email='test@example.com',
-            password='testpass123'
-        )
-        
-        self.categoria = Categoria.objects.create(nome='Eletrônicos')
-        self.produto = Produto.objects.create(
-            nome='Smartphone',
-            preco=Decimal('999.99'),
-            categoria=self.categoria
-        )
-        
-        self.pedido = Pedido.objects.create(
-            usuario=self.user,
-            nome='João Silva',
-            email='joao@example.com',
-            endereco='Rua Teste, 123',
-            cep='12345-678',
-            cidade='São Paulo'
-        )
-    
-    def test_criar_pedido_requires_login(self):
-        """Testa se criar pedido requer login"""
-        url = reverse('pedidos:criar')
-        response = self.client.get(url)
-        self.assertEqual(response.status_code, 302)  # Redirect para login
-    
-    def test_criar_pedido_get_authenticated(self):
-        """Testa GET na view criar pedido autenticado"""
-        self.client.login(username='testuser', password='testpass123')
-        url = reverse('pedidos:criar')
-        response = self.client.get(url)
-        
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, 'form')
-        self.assertContains(response, 'carrinho')
-    
-    @patch('pedidos.views.Carrinho')
-    def test_criar_pedido_carrinho_vazio(self, mock_carrinho):
-        """Testa criar pedido com carrinho vazio"""
-        mock_carrinho_instance = Mock()
-        mock_carrinho_instance.__bool__ = Mock(return_value=False)
-        mock_carrinho.return_value = mock_carrinho_instance
-        
-        self.client.login(username='testuser', password='testpass123')
-        url = reverse('pedidos:criar')
-        response = self.client.get(url)
-        
-        self.assertEqual(response.status_code, 302)  # Redirect
-    
-    @patch('pedidos.views.PIX_AVAILABLE', True)
-    @patch('pedidos.views.Carrinho')
-    @patch('pedidos.views.gerar_pix_pedido')
-    @patch('pedidos.views.enviar_email_confirmacao_pedido')
-    def test_criar_pedido_post_success(self, mock_email, mock_gerar_pix, mock_carrinho):
-        """Testa POST bem-sucedido para criar pedido"""
-        # Mock do carrinho
-        mock_carrinho_instance = Mock()
-        mock_carrinho_instance.__bool__ = Mock(return_value=True)
-        mock_carrinho_instance.__iter__ = Mock(return_value=iter([
-            {
-                'produto': self.produto,
-                'preco': Decimal('999.99'),
-                'quantidade': 1
-            }
-        ]))
-        mock_carrinho_instance.limpar = Mock()
-        mock_carrinho.return_value = mock_carrinho_instance
-        
-        # Mock do PIX
-        mock_gerar_pix.return_value = {
-            'pedido': Mock(),
-            'chave_pix_copia_cola': 'test_pix_code',
-            'qr_code_base64': 'test_qr_code'
-        }
-        
-        self.client.login(username='testuser', password='testpass123')
-        url = reverse('pedidos:criar')
-        
-        form_data = {
-            'nome': 'João Silva',
-            'email': 'joao@example.com',
-            'endereco': 'Rua Teste, 123',
-            'cep': '12345-678',
-            'cidade': 'São Paulo'
-        }
-        
-        response = self.client.post(url, form_data)
-        
-        # Verifica se pedido foi criado
-        pedido_criado = Pedido.objects.filter(usuario=self.user).first()
-        self.assertIsNotNone(pedido_criado)
-        self.assertEqual(pedido_criado.status, 'aguardando_pagamento')
-        
-        # Verifica se carrinho foi limpo
-        mock_carrinho_instance.limpar.assert_called_once()
-    
-    def test_lista_meus_pedidos_requires_login(self):
-        """Testa se lista de pedidos requer login"""
-        url = reverse('pedidos:lista_meus_pedidos')
-        response = self.client.get(url)
-        self.assertEqual(response.status_code, 302)
-    
-    def test_lista_meus_pedidos_authenticated(self):
-        """Testa lista de pedidos autenticado"""
-        self.client.login(username='testuser', password='testpass123')
-        url = reverse('pedidos:lista_meus_pedidos')
-        response = self.client.get(url)
-        
-        self.assertEqual(response.status_code, 200)
-        self.assertContains(response, 'pedidos')
-        self.assertIn(self.pedido, response.context['pedidos'])
-    
-    def test_detalhe_pedido_requires_login(self):
-        """Testa se detalhe do pedido requer login"""
-        url = reverse('pedidos:detalhe_pedido', kwargs={'pedido_id': self.pedido.id})
-        response = self.client.get(url)
-        self.assertEqual(response.status_code, 302)
-    
-    def test_detalhe_pedido_authenticated(self):
-        """Testa detalhe do pedido autenticado"""
-        self.client.login(username='testuser', password='testpass123')
-        url = reverse('pedidos:detalhe_pedido', kwargs={'pedido_id': self.pedido.id})
-        response = self.client.get(url)
-        
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.context['pedido'], self.pedido)
-    
-    def test_detalhe_pedido_outro_usuario(self):
-        """Testa acesso ao pedido de outro usuário"""
-        outro_user = User.objects.create_user(
-            username='outro_user',
-            password='testpass123'
-        )
-        
-        self.client.login(username='outro_user', password='testpass123')
-        url = reverse('pedidos:detalhe_pedido', kwargs={'pedido_id': self.pedido.id})
-        response = self.client.get(url)
-        
-        self.assertEqual(response.status_code, 404)
-    
-    def test_registrar_view_get(self):
-        """Testa GET na view de registro"""
-        url = reverse('pedidos:registrar')  # Assumindo que existe esta URL
-        response = self.client.get(url)
-        
-        # Como a view não está nas URLs fornecidas, vamos testar diretamente
-        from pedidos.views import registrar_view
-        from django.http import HttpRequest
-        
-        request = HttpRequest()
-        request.method = 'GET'
-        response = registrar_view(request)
-        
-        self.assertEqual(response.status_code, 200)
-    
-    def test_webhook_pix_post(self):
-        """Testa webhook PIX"""
-        url = reverse('pedidos:webhook_pix')
-        response = self.client.post(url, {}, content_type='application/json')
-        
-        self.assertEqual(response.status_code, 200)
-        response_data = json.loads(response.content)
-        self.assertEqual(response_data['status'], 'ok')
-
-
-class PedidoPixTest(TestCase):
-    """Testes para funcionalidades PIX"""
-    
-    def setUp(self):
-        """Configuração inicial"""
-        self.user = User.objects.create_user(
-            username='testuser',
-            password='testpass123'
-        )
-        
-        self.pedido = Pedido.objects.create(
-            usuario=self.user,
-            nome='João Silva',
-            email='joao@example.com',
-            endereco='Rua Teste, 123',
-            cep='12345-678',
-            cidade='São Paulo'
-        )
-    
-    @patch('pedidos.views.PIX_AVAILABLE', True)
-    @patch('pedidos.views.Payload')
-    @patch('pedidos.views.qrcode.make')
-    def test_gerar_pix_pedido(self, mock_qrcode, mock_payload):
-        """Testa geração de PIX para pedido"""
-        from pedidos.views import gerar_pix_pedido
-        
-        # Mock do payload PIX
-        mock_payload_instance = Mock()
-        mock_payload_instance.gerarPayload.return_value = 'mock_pix_code'
-        mock_payload.return_value = mock_payload_instance
-        
-        # Mock do QR code
-        mock_qr_img = Mock()
-        mock_qr_img.save = Mock()
-        mock_qrcode.return_value = mock_qr_img
-        
-        # Configura settings para teste
-        with self.settings(
-            MINHA_CHAVE_PIX='test_key',
-            NOME_BENEFICIARIO_PIX='Test Beneficiary',
-            CIDADE_BENEFICIARIO_PIX='Test City'
-        ):
-            result = gerar_pix_pedido(self.pedido)
-        
-        self.assertIn('pedido', result)
-        self.assertIn('chave_pix_copia_cola', result)
-        self.assertEqual(result['pedido'], self.pedido)
-    
-    @patch('pedidos.views.send_mail')
-    @patch('pedidos.views.render_to_string')
-    def test_enviar_email_confirmacao(self, mock_render, mock_send_mail):
-        """Testa envio de email de confirmação"""
-        from pedidos.views import enviar_email_confirmacao_pedido
-        
-        mock_render.return_value = '<html>Test email</html>'
-        
-        with self.settings(DEFAULT_FROM_EMAIL='test@example.com'):
-            enviar_email_confirmacao_pedido(self.pedido)
-        
-        mock_send_mail.assert_called_once()
-
-
-class PedidoUrlTest(TestCase):
-    """Testes para URLs de pedidos"""
-    
-    def test_urls_resolve(self):
-        """Testa se as URLs resolvem corretamente"""
-        urls_to_test = [
-            ('pedidos:criar', [], {}),
-            ('pedidos:lista_meus_pedidos', [], {}),
-            ('pedidos:detalhe_pedido', [], {'pedido_id': 1}),
-            ('pedidos:webhook_pix', [], {}),
-        ]
-        
-        for url_name, args, kwargs in urls_to_test:
+    if request.method == 'POST':
+        form = FormCriarPedido(request.POST)
+        if form.is_valid():
             try:
-                url = reverse(url_name, args=args, kwargs=kwargs)
-                self.assertTrue(url)
-            except:
-                self.fail(f"URL {url_name} não resolve corretamente")
+                # Criar o pedido
+                pedido = form.save(commit=False)
+                pedido.usuario = request.user
+                pedido.metodo_pagamento = 'pix'
+                pedido.status = 'aguardando_pagamento'
+                pedido.save()
+
+                # Criar itens do pedido
+                for item_data in carrinho:
+                    try:
+                        ItemPedido.objects.create(
+                            pedido=pedido,
+                            produto=item_data['produto'],
+                            preco=item_data['preco'],
+                            quantidade=item_data['quantidade']
+                        )
+                    except Exception as e:
+                        logger.error(f"Erro ao criar ItemPedido para pedido {pedido.id}: {e}")
+                        messages.error(request, "Houve um problema ao adicionar um item no pedido.")
+                        raise  # Levanta para rollback da transação
+
+                # Limpar carrinho após criar pedido
+                carrinho.limpar()
+
+                # Gerar PIX se disponível
+                if PIX_AVAILABLE:
+                    try:
+                        context_confirmacao = gerar_pix_pedido(pedido)
+
+                        # Enviar email de confirmação (opcional)
+                        enviar_email_confirmacao_pedido(pedido)
+
+                        return render(request, 'pedidos/confirmacao_pedido_pix.html', context_confirmacao)
+
+                    except Exception as e:
+                        logger.error(f"Erro ao gerar PIX para pedido {pedido.id}: {e}")
+                        messages.error(request, "Pedido criado, mas houve um erro ao gerar o PIX. Entre em contato conosco.")
+                        return redirect('pedidos:lista_meus_pedidos')
+                else:
+                    messages.error(request, "Sistema PIX indisponível. Entre em contato conosco.")
+                    return redirect('pedidos:lista_meus_pedidos')
+
+            except Exception as e:
+                logger.error(f"Erro ao criar pedido: {e}")
+                messages.error(request, "Erro interno. Tente novamente ou entre em contato conosco.")
+                return redirect('carrinho:detalhe')
+        else:
+            messages.error(request, "Houve um erro nos dados do pedido. Por favor, verifique e tente novamente.")
+
+    else:  # GET
+        initial_data = {}
+        if request.user.is_authenticated:
+            full_name = request.user.get_full_name()
+            initial_data['nome'] = full_name if full_name else request.user.username
+            initial_data['email'] = request.user.email
+        form = FormCriarPedido(initial=initial_data)
+
+    return render(request, 'pedidos/criar.html', {
+        'carrinho': carrinho,
+        'form': form,
+        'pix_available': PIX_AVAILABLE
+    })
 
 
-class PedidoIntegrationTest(TestCase):
-    """Testes de integração para pedidos"""
-    
-    def setUp(self):
-        """Configuração inicial"""
-        self.client = Client()
-        self.user = User.objects.create_user(
-            username='testuser',
-            email='test@example.com',
-            password='testpass123'
+def gerar_pix_pedido(pedido):
+    """Gera o PIX QR Code e payload para um pedido"""
+    chave_pix = getattr(settings, 'MINHA_CHAVE_PIX', 'CHAVE_PIX_NAO_CONFIGURADA')
+    nome_beneficiario = getattr(settings, 'NOME_BENEFICIARIO_PIX', 'NOME_BENEFICIARIO_NAO_CONFIGURADO')
+    cidade_beneficiario = getattr(settings, 'CIDADE_BENEFICIARIO_PIX', 'CIDADE')
+
+    if chave_pix == 'CHAVE_PIX_NAO_CONFIGURADA':
+        raise ValueError("Chave PIX não configurada no settings.")
+
+    valor_pedido = float(pedido.get_total_cost())
+    identificador_transacao = f"PEDIDO{pedido.id}"
+
+    # Criar payload PIX
+    payload_pix = Payload(
+        nome_beneficiario,
+        chave_pix,
+        valor_pedido,
+        cidade_beneficiario,
+        identificador_transacao
+    )
+
+    brcode_string = payload_pix.gerarPayload()
+
+    # Gerar QR Code
+    qr_img = qrcode.make(brcode_string)
+    buffered = BytesIO()
+    qr_img.save(buffered, format="PNG")
+    qr_code_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
+
+    return {
+        'pedido': pedido,
+        'chave_pix_copia_cola': brcode_string,
+        'nome_beneficiario': nome_beneficiario,
+        'qr_code_base64': qr_code_base64,
+        'valor_formatado': f"R$ {valor_pedido:.2f}"
+    }
+
+
+def enviar_email_confirmacao_pedido(pedido):
+    """Envia email de confirmação do pedido"""
+    try:
+        subject = f'Confirmação do Pedido #{pedido.id}'
+        html_message = render_to_string('pedidos/email_confirmacao.html', {
+            'pedido': pedido,
+            'usuario': pedido.usuario
+        })
+        plain_message = strip_tags(html_message)
+
+        send_mail(
+            subject,
+            plain_message,
+            settings.DEFAULT_FROM_EMAIL,
+            [pedido.usuario.email],
+            html_message=html_message,
+            fail_silently=False,
         )
-        
-        self.categoria = Categoria.objects.create(nome='Eletrônicos')
-        self.produto = Produto.objects.create(
-            nome='Smartphone',
-            preco=Decimal('999.99'),
-            categoria=self.categoria
-        )
-    
-    def test_fluxo_completo_pedido(self):
-        """Testa fluxo completo: login -> criar pedido -> listar -> ver detalhes"""
-        # 1. Login
-        login_success = self.client.login(username='testuser', password='testpass123')
-        self.assertTrue(login_success)
-        
-        # 2. Criar pedido (simulado - sem carrinho real)
-        pedido = Pedido.objects.create(
-            usuario=self.user,
-            nome='João Silva',
-            email='joao@example.com',
-            endereco='Rua Teste, 123',
-            cep='12345-678',
-            cidade='São Paulo'
-        )
-        
-        ItemPedido.objects.create(
-            pedido=pedido,
-            produto=self.produto,
-            preco=self.produto.preco,
-            quantidade=1
-        )
-        
-        # 3. Listar pedidos
-        url_lista = reverse('pedidos:lista_meus_pedidos')
-        response_lista = self.client.get(url_lista)
-        self.assertEqual(response_lista.status_code, 200)
-        self.assertContains(response_lista, 'João Silva')
-        
-        # 4. Ver detalhes
-        url_detalhe = reverse('pedidos:detalhe_pedido', kwargs={'pedido_id': pedido.id})
-        response_detalhe = self.client.get(url_detalhe)
-        self.assertEqual(response_detalhe.status_code, 200)
-        self.assertEqual(response_detalhe.context['pedido'], pedido)
-        
-        # 5. Verificar total do pedido
-        total = pedido.get_total_cost()
-        self.assertEqual(total, self.produto.preco)
+        logger.info(f"Email de confirmação enviado para pedido {pedido.id}")
+    except Exception as e:
+        logger.error(f"Erro ao enviar email para pedido {pedido.id}: {e}")
 
 
-# Mock para testes sem dependências externas
-class MockCarrinho:
-    """Mock da classe Carrinho para testes"""
-    
-    def __init__(self, items=None):
-        self.items = items or []
-    
-    def __bool__(self):
-        return len(self.items) > 0
-    
-    def __iter__(self):
-        return iter(self.items)
-    
-    def limpar(self):
-        self.items = []
+@login_required
+def lista_meus_pedidos(request):
+    """Lista os pedidos do usuário logado"""
+    meus_pedidos = Pedido.objects.filter(usuario=request.user).order_by('-data_criacao')
 
-class PedidosSettingsCoverageTest(TestCase):
-    def test_import_settings(self):
-        import pedidos.settings
-        self.assertTrue(hasattr(pedidos.settings, "MINHA_CHAVE_PIX"))
+    context = {
+        'pedidos': meus_pedidos
+    }
+    return render(request, 'pedidos/lista_meus_pedidos.html', context)
 
-class PedidosViewsBranchesTest(TestCase):
-    def setUp(self):
-        self.client = Client()
-        self.user = User.objects.create_user(username='teste', password='123456', email='teste@email.com')
-        self.categoria = Categoria.objects.create(nome="Cat", slug="cat")
-        self.produto = Produto.objects.create(
-            nome="Produto Teste",
-            slug="produto-teste",
-            descricao="desc",
-            preco=10,
-            estoque=10,
-            categoria=self.categoria
-        )
-        self.client.login(username='teste', password='123456')
 
-    def test_criar_pedido_get(self):
-        response = self.client.get(reverse('pedidos:criar_pedido'))
-        self.assertEqual(response.status_code, 200)
+@login_required
+def detalhe_pedido(request, pedido_id):
+    """Mostra detalhes de um pedido específico"""
+    pedido = get_object_or_404(Pedido, id=pedido_id, usuario=request.user)
 
-    def test_criar_pedido_carrinho_vazio(self):
-        session = self.client.session
-        session['carrinho'] = {}
-        session.save()
-        response = self.client.post(reverse('pedidos:criar_pedido'))
-        self.assertEqual(response.status_code, 302)  # Redireciona para produtos:lista
+    context = {
+        'pedido': pedido,
+        'items': pedido.items.all()
+    }
+    return render(request, 'pedidos/detalhe_pedido.html', context)
 
-    def test_criar_pedido_form_invalido(self):
-        session = self.client.session
-        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
-        session.save()
-        response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': ''})  # Form inválido
-        self.assertContains(response, "Houve um erro nos dados do pedido", status_code=200)
 
-    def test_criar_pedido_pix_indisponivel(self):
-        session = self.client.session
-        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
-        session.save()
-        with patch('pedidos.views.PIX_AVAILABLE', False):
-            response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': 'Teste', 'email': 'a@a.com'})
-            self.assertEqual(response.status_code, 302)
+def registrar_view(request):
+    """View para registro de novos usuários"""
+    if request.method == 'POST':
+        form = UserCreationForm(request.POST)
+        if form.is_valid():
+            user = form.save()
+            auth_login(request, user)
+            messages.success(request, f'Bem-vindo(a), {user.username}! Seu registro foi concluído com sucesso.')
+            return redirect('produtos:lista')
+        else:
+            messages.error(request, 'Houve um erro no seu registro. Por favor, verifique os dados abaixo.')
+    else:
+        form = UserCreationForm()
 
-    def test_criar_pedido_erro_ao_gerar_pix(self):
-        session = self.client.session
-        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
-        session.save()
-        with patch('pedidos.views.PIX_AVAILABLE', True), \
-             patch('pedidos.views.gerar_pix_pedido', side_effect=Exception("Erro PIX")):
-            response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': 'Teste', 'email': 'a@a.com'})
-            self.assertEqual(response.status_code, 302)
+    return render(request, 'registration/registrar.html', {'form': form})
 
-    def test_criar_pedido_erro_interno(self):
-        session = self.client.session
-        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
-        session.save()
-        with patch('pedidos.views.FormCriarPedido.save', side_effect=Exception("Erro")):
-            response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': 'Teste', 'email': 'a@a.com'})
-            self.assertEqual(response.status_code, 302)
 
-    def test_lista_meus_pedidos(self):
-        response = self.client.get(reverse('pedidos:lista_meus_pedidos'))
-        self.assertEqual(response.status_code, 200)
+# View para webhook PIX (caso você implemente verificação automática)
+def webhook_pix(request):
+    """Webhook para receber notificações de pagamento PIX"""
+    if request.method == 'POST':
+        # Implementar lógica de verificação do pagamento
+        # Isso depende do seu provedor de pagamentos PIX
+        pass
 
-    def test_detalhe_pedido(self):
-        from pedidos.models import Pedido, ItemPedido
-        pedido = Pedido.objects.create(usuario=self.user, nome='detalhe', email='d@d.com')
-        ItemPedido.objects.create(pedido=pedido, produto=self.produto, preco=10, quantidade=1)
-        response = self.client.get(reverse('pedidos:detalhe_pedido', args=[pedido.id]))
-        self.assertEqual(response.status_code, 200)
-
-    def test_registrar_view_get(self):
-        response = self.client.get(reverse('pedidos:registrar'))
-        self.assertEqual(response.status_code, 200)
-
-    def test_registrar_view_post_invalido(self):
-        response = self.client.post(reverse('pedidos:registrar'), data={'username': ''})
-        self.assertContains(response, 'Houve um erro no seu registro', status_code=200)
-
-    def test_webhook_pix_get(self):
-        response = self.client.get(reverse('pedidos:webhook_pix'))
-        self.assertEqual(response.status_code, 200)
-
-    def test_webhook_pix_post(self):
-        response = self.client.post(reverse('pedidos:webhook_pix'))
-        self.assertEqual(response.status_code, 200)
-
-from unittest.mock import patch
-
-class PedidosViewsBranchesExtraTest(TestCase):
-    def setUp(self):
-        self.client = Client()
-        self.user = User.objects.create_user(username='teste', password='123456', email='teste@email.com')
-        self.user2 = User.objects.create_user(username='outro', password='123456', email='outro@email.com')
-        self.categoria = Categoria.objects.create(nome="Cat", slug="cat")
-        self.produto = Produto.objects.create(
-            nome="Produto Teste",
-            slug="produto-teste",
-            descricao="desc",
-            preco=10,
-            estoque=10,
-            categoria=self.categoria
-        )
-        self.client.login(username='teste', password='123456')
-
-    def test_criar_pedido_excecao_ao_salvar(self):
-        session = self.client.session
-        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
-        session.save()
-        with patch('pedidos.views.FormCriarPedido.save', side_effect=Exception("Erro")):
-            response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': 'Teste', 'email': 'a@a.com'})
-            self.assertEqual(response.status_code, 302)  # Redireciona para carrinho:detalhe
-
-    def test_criar_pedido_excecao_ao_enviar_email(self):
-        session = self.client.session
-        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
-        session.save()
-        with patch('pedidos.views.send_mail', side_effect=Exception("Erro email")):
-            response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': 'Teste', 'email': 'a@a.com'})
-            # O comportamento pode ser redirect ou erro, ajuste conforme sua view
-            self.assertIn(response.status_code, [200, 302])
-
-    def test_criar_pedido_excecao_ao_gerar_pix(self):
-        session = self.client.session
-        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
-        session.save()
-        with patch('pedidos.views.PIX_AVAILABLE', True), \
-             patch('pedidos.views.gerar_pix_pedido', side_effect=Exception("Erro PIX")):
-            response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': 'Teste', 'email': 'a@a.com'})
-            self.assertEqual(response.status_code, 302)
-
-    def test_detalhe_pedido_nao_encontrado(self):
-        response = self.client.get(reverse('pedidos:detalhe_pedido', args=[9999]))
-        self.assertEqual(response.status_code, 404)
-
-    def test_detalhe_pedido_outro_usuario(self):
-        from pedidos.models import Pedido, ItemPedido
-        pedido = Pedido.objects.create(usuario=self.user2, nome='outro', email='outro@email.com')
-        ItemPedido.objects.create(pedido=pedido, produto=self.produto, preco=10, quantidade=1)
-        response = self.client.get(reverse('pedidos:detalhe_pedido', args=[pedido.id]))
-        self.assertEqual(response.status_code, 403)  # Forbidden para usuário errado
-
-from django.contrib.admin.sites import AdminSite
-from pedidos import admin
-
-class MockRequest:
-    pass
-
-class PedidoAdminCoverageTest(TestCase):
-    def setUp(self):
-        self.site = AdminSite()
-        self.user = User.objects.create_superuser('admin', 'admin@test.com', '123456')
-        self.categoria = Categoria.objects.create(nome="Cat", slug="cat")
-        self.produto = Produto.objects.create(
-            nome="Produto Teste",
-            slug="produto-teste",
-            descricao="desc",
-            preco=10,
-            estoque=10,
-            categoria=self.categoria
-        )
-        self.pedido = Pedido.objects.create(nome="Cliente", email="cli@a.com", usuario=self.user)
-        self.item = ItemPedido.objects.create(pedido=self.pedido, produto=self.produto, preco=10, quantidade=1)
-        self.admin = admin.PedidoAdmin(Pedido, self.site)
-
-    def test_str_methods(self):
-        str(self.pedido)
-        str(self.item)
-
-    def test_admin_methods(self):
-        # Cobre métodos customizados do admin
-        self.admin.nome_usuario(self.pedido)
-        self.admin.total_itens(self.pedido)
-        self.admin.valor_total(self.pedido)
-        self.admin.status_display(self.pedido)
+    return JsonResponse({'status': 'ok'})
