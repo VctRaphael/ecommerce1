@@ -265,3 +265,56 @@ class CarrinhoCoberturaExtraTest(TestCase):
         # Não deve dar erro, cobre o branch final do método
         carrinho.limpar()
         self.assertNotIn(settings.CARRINHO_SESSION_ID, request.session) # Verifica se o carrinho foi removido da sessão
+
+from .forms import FormAdicionarProdutoCarrinho
+from django.test import TestCase
+
+class CarrinhoFormsLimiteTest(TestCase):
+    def test_form_quantidade_minima(self):
+        form = FormAdicionarProdutoCarrinho(data={'quantidade': 1, 'override': False})
+        self.assertTrue(form.is_valid())
+
+    def test_form_quantidade_maxima(self):
+        form = FormAdicionarProdutoCarrinho(data={'quantidade': 20, 'override': False})
+        self.assertTrue(form.is_valid())
+
+    def test_form_quantidade_abaixo_minimo(self):
+        form = FormAdicionarProdutoCarrinho(data={'quantidade': 0, 'override': False})
+        self.assertFalse(form.is_valid())
+
+    def test_form_quantidade_acima_maximo(self):
+        form = FormAdicionarProdutoCarrinho(data={'quantidade': 21, 'override': False})
+        self.assertFalse(form.is_valid())
+
+class CarrinhoViewsBranchesTest(TestCase):
+    def setUp(self):
+        self.client = Client()
+        self.categoria = Categoria.objects.create(nome="Cat", slug="cat")
+        self.produto = Produto.objects.create(
+            nome="Produto Teste",
+            slug="produto-teste",
+            descricao="desc",
+            preco=10,
+            estoque=10,
+            categoria=self.categoria
+        )
+
+    def test_adicionar_produto_get(self):
+        url = reverse('carrinho:adicionar', kwargs={'produto_id': self.produto.id})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 405)  # Method Not Allowed
+
+    def test_adicionar_produto_inexistente(self):
+        url = reverse('carrinho:adicionar', kwargs={'produto_id': 9999})
+        response = self.client.post(url, data={'quantidade': 1})
+        self.assertEqual(response.status_code, 404)
+
+    def test_remover_produto_get(self):
+        url = reverse('carrinho:remover', kwargs={'produto_id': self.produto.id})
+        response = self.client.get(url)
+        self.assertEqual(response.status_code, 405)
+
+    def test_remover_produto_inexistente(self):
+        url = reverse('carrinho:remover', kwargs={'produto_id': 9999})
+        response = self.client.post(url)
+        self.assertEqual(response.status_code, 404)

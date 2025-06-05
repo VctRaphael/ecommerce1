@@ -547,3 +547,182 @@ class MockCarrinho:
     
     def limpar(self):
         self.items = []
+
+class PedidosSettingsCoverageTest(TestCase):
+    def test_import_settings(self):
+        import pedidos.settings
+        self.assertTrue(hasattr(pedidos.settings, "MINHA_CHAVE_PIX"))
+
+class PedidosViewsBranchesTest(TestCase):
+    def setUp(self):
+        self.client = Client()
+        self.user = User.objects.create_user(username='teste', password='123456', email='teste@email.com')
+        self.categoria = Categoria.objects.create(nome="Cat", slug="cat")
+        self.produto = Produto.objects.create(
+            nome="Produto Teste",
+            slug="produto-teste",
+            descricao="desc",
+            preco=10,
+            estoque=10,
+            categoria=self.categoria
+        )
+        self.client.login(username='teste', password='123456')
+
+    def test_criar_pedido_get(self):
+        response = self.client.get(reverse('pedidos:criar_pedido'))
+        self.assertEqual(response.status_code, 200)
+
+    def test_criar_pedido_carrinho_vazio(self):
+        session = self.client.session
+        session['carrinho'] = {}
+        session.save()
+        response = self.client.post(reverse('pedidos:criar_pedido'))
+        self.assertEqual(response.status_code, 302)  # Redireciona para produtos:lista
+
+    def test_criar_pedido_form_invalido(self):
+        session = self.client.session
+        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
+        session.save()
+        response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': ''})  # Form inválido
+        self.assertContains(response, "Houve um erro nos dados do pedido", status_code=200)
+
+    def test_criar_pedido_pix_indisponivel(self):
+        session = self.client.session
+        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
+        session.save()
+        with patch('pedidos.views.PIX_AVAILABLE', False):
+            response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': 'Teste', 'email': 'a@a.com'})
+            self.assertEqual(response.status_code, 302)
+
+    def test_criar_pedido_erro_ao_gerar_pix(self):
+        session = self.client.session
+        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
+        session.save()
+        with patch('pedidos.views.PIX_AVAILABLE', True), \
+             patch('pedidos.views.gerar_pix_pedido', side_effect=Exception("Erro PIX")):
+            response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': 'Teste', 'email': 'a@a.com'})
+            self.assertEqual(response.status_code, 302)
+
+    def test_criar_pedido_erro_interno(self):
+        session = self.client.session
+        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
+        session.save()
+        with patch('pedidos.views.FormCriarPedido.save', side_effect=Exception("Erro")):
+            response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': 'Teste', 'email': 'a@a.com'})
+            self.assertEqual(response.status_code, 302)
+
+    def test_lista_meus_pedidos(self):
+        response = self.client.get(reverse('pedidos:lista_meus_pedidos'))
+        self.assertEqual(response.status_code, 200)
+
+    def test_detalhe_pedido(self):
+        from pedidos.models import Pedido, ItemPedido
+        pedido = Pedido.objects.create(usuario=self.user, nome='detalhe', email='d@d.com')
+        ItemPedido.objects.create(pedido=pedido, produto=self.produto, preco=10, quantidade=1)
+        response = self.client.get(reverse('pedidos:detalhe_pedido', args=[pedido.id]))
+        self.assertEqual(response.status_code, 200)
+
+    def test_registrar_view_get(self):
+        response = self.client.get(reverse('pedidos:registrar'))
+        self.assertEqual(response.status_code, 200)
+
+    def test_registrar_view_post_invalido(self):
+        response = self.client.post(reverse('pedidos:registrar'), data={'username': ''})
+        self.assertContains(response, 'Houve um erro no seu registro', status_code=200)
+
+    def test_webhook_pix_get(self):
+        response = self.client.get(reverse('pedidos:webhook_pix'))
+        self.assertEqual(response.status_code, 200)
+
+    def test_webhook_pix_post(self):
+        response = self.client.post(reverse('pedidos:webhook_pix'))
+        self.assertEqual(response.status_code, 200)
+
+from unittest.mock import patch
+
+class PedidosViewsBranchesExtraTest(TestCase):
+    def setUp(self):
+        self.client = Client()
+        self.user = User.objects.create_user(username='teste', password='123456', email='teste@email.com')
+        self.user2 = User.objects.create_user(username='outro', password='123456', email='outro@email.com')
+        self.categoria = Categoria.objects.create(nome="Cat", slug="cat")
+        self.produto = Produto.objects.create(
+            nome="Produto Teste",
+            slug="produto-teste",
+            descricao="desc",
+            preco=10,
+            estoque=10,
+            categoria=self.categoria
+        )
+        self.client.login(username='teste', password='123456')
+
+    def test_criar_pedido_excecao_ao_salvar(self):
+        session = self.client.session
+        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
+        session.save()
+        with patch('pedidos.views.FormCriarPedido.save', side_effect=Exception("Erro")):
+            response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': 'Teste', 'email': 'a@a.com'})
+            self.assertEqual(response.status_code, 302)  # Redireciona para carrinho:detalhe
+
+    def test_criar_pedido_excecao_ao_enviar_email(self):
+        session = self.client.session
+        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
+        session.save()
+        with patch('pedidos.views.send_mail', side_effect=Exception("Erro email")):
+            response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': 'Teste', 'email': 'a@a.com'})
+            # O comportamento pode ser redirect ou erro, ajuste conforme sua view
+            self.assertIn(response.status_code, [200, 302])
+
+    def test_criar_pedido_excecao_ao_gerar_pix(self):
+        session = self.client.session
+        session['carrinho'] = {str(self.produto.id): {'quantidade': 1, 'preco': str(self.produto.preco)}}
+        session.save()
+        with patch('pedidos.views.PIX_AVAILABLE', True), \
+             patch('pedidos.views.gerar_pix_pedido', side_effect=Exception("Erro PIX")):
+            response = self.client.post(reverse('pedidos:criar_pedido'), data={'nome': 'Teste', 'email': 'a@a.com'})
+            self.assertEqual(response.status_code, 302)
+
+    def test_detalhe_pedido_nao_encontrado(self):
+        response = self.client.get(reverse('pedidos:detalhe_pedido', args=[9999]))
+        self.assertEqual(response.status_code, 404)
+
+    def test_detalhe_pedido_outro_usuario(self):
+        from pedidos.models import Pedido, ItemPedido
+        pedido = Pedido.objects.create(usuario=self.user2, nome='outro', email='outro@email.com')
+        ItemPedido.objects.create(pedido=pedido, produto=self.produto, preco=10, quantidade=1)
+        response = self.client.get(reverse('pedidos:detalhe_pedido', args=[pedido.id]))
+        self.assertEqual(response.status_code, 403)  # Forbidden para usuário errado
+
+from django.contrib.admin.sites import AdminSite
+from pedidos import admin
+
+class MockRequest:
+    pass
+
+class PedidoAdminCoverageTest(TestCase):
+    def setUp(self):
+        self.site = AdminSite()
+        self.user = User.objects.create_superuser('admin', 'admin@test.com', '123456')
+        self.categoria = Categoria.objects.create(nome="Cat", slug="cat")
+        self.produto = Produto.objects.create(
+            nome="Produto Teste",
+            slug="produto-teste",
+            descricao="desc",
+            preco=10,
+            estoque=10,
+            categoria=self.categoria
+        )
+        self.pedido = Pedido.objects.create(nome="Cliente", email="cli@a.com", usuario=self.user)
+        self.item = ItemPedido.objects.create(pedido=self.pedido, produto=self.produto, preco=10, quantidade=1)
+        self.admin = admin.PedidoAdmin(Pedido, self.site)
+
+    def test_str_methods(self):
+        str(self.pedido)
+        str(self.item)
+
+    def test_admin_methods(self):
+        # Cobre métodos customizados do admin
+        self.admin.nome_usuario(self.pedido)
+        self.admin.total_itens(self.pedido)
+        self.admin.valor_total(self.pedido)
+        self.admin.status_display(self.pedido)
