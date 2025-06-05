@@ -156,3 +156,8 @@ DEFAULT_FROM_EMAIL = 'seu-email@gmail.com'
 if not DEBUG:
     ALLOWED_HOSTS = ['seudominio.com', 'www.seudominio.com']
     CSRF_TRUSTED_ORIGINS = ['https://seudominio.com', 'https://www.seudominio.com']
+
+if not DEBUG:
+    ALLOWED_HOSTS = [...]
+    CSRF_TRUSTED_ORIGINS = [...]
+
